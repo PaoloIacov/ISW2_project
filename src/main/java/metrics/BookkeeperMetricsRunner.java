@@ -9,513 +9,679 @@ import com.opencsv.CSVReader;
 import com.opencsv.CSVReaderBuilder;
 import com.opencsv.CSVWriter;
 import com.opencsv.exceptions.CsvValidationException;
+import lombok.Setter;
 import model.ReleaseInfo;
+import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.nio.file.*;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Esegue CK sul codice sorgente di BookKeeper e
- * aggiunge i dati di metodi delle release al CSV esistente.
- * Utilizza OpenCSV per una gestione robusta dei file CSV.
+ * Runner per l'estrazione delle metriche del codice dal progetto Bookkeeper.
+ * Utilizza direttamente il repository Git per l'analisi storica.
  */
 public class BookkeeperMetricsRunner {
 
+    // Logger configurato per usare direttamente System.err per aggirare eventuali configurazioni
+    private static final PrintStream LOG = System.err;
+
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
+    // Definizione di una classe interna per memorizzare la storia dei metodi
+    private static class MethodHistoryData {
+        @Setter
+        private LocalDate firstSeen;
+        private final Set<String> authors;
+        private int churnCount;
+        private int locAdded;
+
+        public MethodHistoryData() {
+            this.authors = new HashSet<>();
+            this.churnCount = 0;
+            this.locAdded = 0;
+        }
+
+        public LocalDate getFirstSeen() {
+            return firstSeen;
+        }
+
+        public Set<String> getAuthors() {
+            return authors;
+        }
+
+        public void addAuthor(String author) {
+            this.authors.add(author);
+        }
+
+        public int getChurnCount() {
+            return churnCount;
+        }
+
+        public void incrementChurn() {
+            this.churnCount++;
+        }
+
+        public int getLocAdded() {
+            return locAdded;
+        }
+
+        public void addLOC(int loc) {
+            this.locAdded += loc;
+        }
+    }
+
+    private static final Map<String, MethodHistoryData> METHOD_HISTORIES = new ConcurrentHashMap<>();
+
+    // Percorsi
+    private static Path repoPath;
+    private static Path outputDir;
+    private static String outputCsvPath;
+    private static Properties properties;
+    private static Git git;
+
+    // Metriche
+    private static final List<CodeMetric> METRICS = new ArrayList<>();
+
     public static void main(String[] args) {
-        /* ------------ configurazione -------------- */
-        String projectDir = args.length > 0 ? args[0] : "/Users/iacov/ISW2_Project_Falessi/ck/bookkeeper";    // clone locale
-        String subDir     = args.length > 1 ? args[1] : "";                 // lasciarlo vuoto => tutto il repo
-        String outputCsvPath = args.length > 2 ? args[2] : "bookkeeper_metrics.csv";
-        String inputCsvPath = args.length > 3 ? args[3] : "/Users/iacov/Library/Mobile Documents/com~apple~CloudDocs/BOOKKEEPERVersionInfo.csv";
-        /* ------------------------------------------ */
+        // Test output diretto
+        LOG.println("🔍 TEST LOG INIZIALE - Verifica output errori");
+        System.out.println("🔍 TEST LOG INIZIALE - Verifica output standard");
 
         try {
-            // Verifica che il repository git esista e contiene i tag
-            ensureRepositoryExists(projectDir);
+            LOG.println("🚀 AVVIO APPLICAZIONE: Inizio estrazione metriche per Bookkeeper");
 
-            // Debug: mostra alcuni tag disponibili
-            System.out.println("📋 Tag disponibili nel repository:");
-            listAvailableTags(projectDir);
+            // Carica le proprietà dal file info.properties
+            loadProperties();
+            LOG.println("✅ Properties caricate con successo");
 
-            // Leggi le release dal file di informazioni sulle release
-            List<ReleaseInfo> releases = readReleasesFromCsv(inputCsvPath);
+            // Inizializza i percorsi dai valori delle proprietà
+            repoPath = Paths.get(properties.getProperty("info.repo.path"));
+            outputDir = Paths.get(properties.getProperty("info.output.path"));
+            outputCsvPath = outputDir.resolve("bookkeeper_metrics.csv").toString();
+            LOG.println("📁 Percorsi configurati:");
+            LOG.println("   - Repository: " + repoPath);
+            LOG.println("   - Output: " + outputCsvPath);
 
-            if (releases.isEmpty()) {
-                System.out.println("❌ Nessuna release trovata in " + inputCsvPath);
-                return;
+            // Verifica se esistono file di log nella directory corrente
+            LOG.println("🔍 Ricerca file di log nella directory corrente:");
+            try {
+                Files.list(Paths.get(""))
+                    .filter(p -> p.toString().contains(".log"))
+                    .forEach(p -> LOG.println("   - File di log trovato: " + p));
+            } catch (Exception e) {
+                LOG.println("❌ Errore nella ricerca dei file di log: " + e.getMessage());
             }
 
-            // Usa tutte le release presenti nel CSV
-            List<ReleaseInfo> selectedReleases = new ArrayList<>(releases);
-            System.out.println("📊 Analisi delle seguenti release (" + selectedReleases.size() + "/" + releases.size() + "):");
-            for (ReleaseInfo release : selectedReleases) {
-                System.out.println("- " + release.getName() + " (" + release.getDate() + ")");
+            // Inizializza il repository Git
+            LOG.println("🔄 Inizializzazione repository Git...");
+            initGitRepository();
+            LOG.println("✅ Repository Git inizializzato");
+
+            // Inizializza le metriche
+            LOG.println("🔄 Inizializzazione metriche...");
+            initializeMetrics();
+            LOG.println("✅ Metriche inizializzate: " + METRICS.size() + " metriche configurate");
+
+            // Estrai informazioni sulle release
+            LOG.println("🔄 Estrazione informazioni sulle release...");
+            List<ReleaseInfo> releases = extractReleaseInfo();
+            LOG.println("✅ Releases estratte: " + releases.size() + " versioni trovate");
+            for (ReleaseInfo release : releases) {
+                LOG.println("   - " + release.getName() + " (" + release.getDate() + ")");
             }
 
-            // Prepara il file di output
-            File csvFile = new File(outputCsvPath);
-            boolean fileExists = csvFile.exists();
+            // Crea la directory di output se non esiste
+            if (!Files.exists(outputDir)) {
+                LOG.println("🔄 Creazione directory di output: " + outputDir);
+                Files.createDirectories(outputDir);
+                LOG.println("✅ Directory creata");
+            }
 
-            int successfulReleases = 0;
-            // Per ogni release selezionata, estrai le metriche
-            for (ReleaseInfo release : selectedReleases) {
-                System.out.println("\n🔄 Elaborazione release: " + release.getName());
+            // Verifica se il file CSV esiste già
+            boolean fileExists = Files.exists(Paths.get(outputCsvPath));
+            LOG.println(fileExists ? "ℹ️ File CSV già esistente" : "ℹ️ File CSV non esistente, verrà creato");
 
-                // Checkout alla versione richiesta
+            // Crea l'intestazione se il file non esiste
+            if (!fileExists) {
+                LOG.println("🔄 Creazione intestazione CSV...");
+                createCsvHeader();
+                LOG.println("✅ Intestazione CSV creata");
+            }
+
+            // Per ogni release, esegui l'analisi
+            int releaseCounter = 0;
+            for (ReleaseInfo release : releases) {
+                releaseCounter++;
+                LOG.println("\n==================================================");
+                LOG.println("🔄 ANALISI RELEASE " + releaseCounter + "/" + releases.size() + ": " + release.getName());
+                LOG.println("==================================================");
+
                 try {
-                    gitCheckout(projectDir, release.getName());
-                    successfulReleases++;
-                } catch (Exception e) {
-                    System.err.println("❌ Errore durante il checkout della release " + release.getName() + ": " + e.getMessage());
-                    continue;
-                }
+                    // Checkout della versione specifica
+                    LOG.println("🔄 Checkout della versione: " + release.getName());
+                    gitCheckout(release.getName());
 
-                // Analizza la release corrente
-                try {
-                    processRelease(release, projectDir, subDir, outputCsvPath, fileExists);
-                    // Se è la prima release elaborata, il file ora esiste
-                    fileExists = true;
+                    // Verifica dei file dopo il checkout
+                    LOG.println("🔍 Verifica dei file nel repository dopo checkout:");
+                    verifyRepositoryFiles();
+
+                    // Analizza la release e aggiungi i risultati al CSV
+                    LOG.println("🔄 Analisi della release...");
+                    analyzeRelease(release);
+                    LOG.println("✅ Analisi della release completata: " + release.getName());
                 } catch (Exception e) {
-                    System.err.println("❌ Errore durante l'elaborazione della release " + release.getName() + ": " + e.getMessage());
+                    LOG.println("❌ ERRORE durante l'analisi della release " + release.getName() + ": " + e.getMessage());
+                    e.printStackTrace();
                 }
+                LOG.println("--------------------------------------------------");
             }
 
-            System.out.println("\n✅ Elaborazione completata per " + successfulReleases + " release su " + selectedReleases.size());
+            // Ritorna al branch principale
+            LOG.println("🔄 Ritorno al branch principale...");
+            try {
+                git.checkout().setName("main").call();
+                LOG.println("✅ Checkout a 'main' completato");
+            } catch (Exception e) {
+                LOG.println("ℹ️ Branch 'main' non trovato, tentativo con 'master'...");
+                git.checkout().setName("master").call();
+                LOG.println("✅ Checkout a 'master' completato");
+            }
 
-        } catch (Exception e) {
-            System.err.println("❌ Errore durante l'esecuzione: " + e.getMessage());
+            LOG.println("\n🎉 ANALISI COMPLETATA 🎉");
+            System.out.println("Analisi completata. I risultati sono stati salvati in: " + outputCsvPath);
+
+        } catch (IOException | GitAPIException e) {
+            LOG.println("❌ ERRORE FATALE: " + e.getMessage());
             e.printStackTrace();
-        }
-    }
-
-    private static void ensureRepositoryExists(String projectDir) throws IOException, InterruptedException {
-        Path path = Path.of(projectDir);
-
-        if (!Files.exists(path)) {
-            System.out.println("🔄 Il repository BookKeeper non esiste, lo clono da GitHub...");
-            Files.createDirectories(path.getParent());
-
-            ProcessBuilder pbClone = new ProcessBuilder(
-                    "git", "clone", "https://github.com/apache/bookkeeper.git", projectDir
-            );
-            pbClone.inheritIO();
-            Process process = pbClone.start();
-            int exitCode = process.waitFor();
-
-            if (exitCode != 0) {
-                throw new IOException("Errore nel clonare il repository (codice: " + exitCode + ")");
+        } finally {
+            // Chiudi il repository Git
+            if (git != null) {
+                LOG.println("🔄 Chiusura repository Git...");
+                git.close();
+                LOG.println("✅ Repository Git chiuso");
             }
-
-            System.out.println("✅ Repository clonato correttamente");
-        }
-
-        // Assicurati di avere tutti i tag
-        System.out.println("🔄 Aggiorno il repository e scarico tutti i tag...");
-
-        ProcessBuilder pbFetch = new ProcessBuilder(
-                "git", "fetch", "--all", "--tags"
-        );
-        pbFetch.directory(new File(projectDir));
-        pbFetch.inheritIO();
-        Process process = pbFetch.start();
-        int exitCode = process.waitFor();
-
-        if (exitCode != 0) {
-            System.out.println("⚠️ Avviso: problemi nell'aggiornare il repository (codice: " + exitCode + ")");
-        } else {
-            System.out.println("✅ Repository aggiornato");
-        }
-    }
-
-    private static List<String> listAvailableTags(String projectDir) {
-        List<String> tags = new ArrayList<>();
-        try {
-            // Prova a usare git ls-remote per vedere i tag remoti
-            ProcessBuilder pb = new ProcessBuilder(
-                    "git", "ls-remote", "--tags", "origin");
-            pb.directory(new File(projectDir));
-            Process process = pb.start();
-
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    // Il formato è: hash    refs/tags/nome-tag
-                    if (line.contains("refs/tags/") && !line.contains("^{}")) {
-                        String tag = line.split("refs/tags/")[1].trim();
-                        tags.add(tag);
-                    }
-                }
-            }
-
-            process.waitFor();
-
-            // Se non ha funzionato, prova con il metodo locale
-            if (tags.isEmpty()) {
-                System.out.println("  Provo con git tag locale...");
-                pb = new ProcessBuilder("git", "tag", "-l");
-                pb.directory(new File(projectDir));
-                process = pb.start();
-
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        tags.add(line.trim());
-                    }
-                }
-
-                process.waitFor();
-            }
-
-            if (tags.isEmpty()) {
-                System.out.println("  Nessun tag trovato");
-            } else {
-                List<String> displayTags = tags.size() > 5 ? tags.subList(0, 5) : tags;
-                System.out.println("  " + String.join(", ", displayTags) +
-                        (tags.size() > 5 ? "... (" + tags.size() + " tag totali)" : ""));
-            }
-        } catch (Exception e) {
-            System.err.println("  Impossibile leggere i tag: " + e.getMessage());
-        }
-        return tags;
-    }
-
-    private static List<ReleaseInfo> readReleasesFromCsv(String csvPath) throws IOException {
-        List<ReleaseInfo> releases = new ArrayList<>();
-        File csvFile = new File(csvPath);
-
-        if (!csvFile.exists()) {
-            System.err.println("❌ File CSV non trovato: " + csvPath);
-            return releases;
-        }
-
-        System.out.println("📄 Lettura del file CSV: " + csvPath + " (dimensione: " + csvFile.length() + " bytes)");
-
-        try (CSVReader reader = new CSVReaderBuilder(new FileReader(csvPath))
-                .withCSVParser(new CSVParserBuilder()
-                        .withSeparator(';')
-                        .build())
-                .build()) {
-            // resto del codice invariato
-            String[] header = reader.readNext();
-            if (header == null) {
-                System.err.println("❌ File CSV vuoto o non valido");
-                return releases;
-            }
-
-            System.out.println("  Intestazione CSV: " + String.join(";", header));
-
-            // Determina gli indici delle colonne in base all'intestazione
-            int idIndex = -1;
-            int nameIndex = -1;
-            int dateIndex = -1;
-
-            for (int i = 0; i < header.length; i++) {
-                String col = header[i].toLowerCase();
-                if (col.contains("id")) {
-                    idIndex = i;
-                } else if (col.contains("version") || col.contains("name")) {
-                    nameIndex = i;
-                } else if (col.contains("date")) {
-                    dateIndex = i;
-                }
-            }
-
-            // Se non troviamo le colonne, usa dei valori predefiniti
-            if (idIndex == -1) idIndex = 0;
-            if (nameIndex == -1) nameIndex = 1;
-            if (dateIndex == -1) dateIndex = 2;
-
-            System.out.println("  Utilizzo colonne: ID=" + idIndex + ", Name=" + nameIndex + ", Date=" + dateIndex);
-
-            String[] line;
-            int lineNumber = 1;
-            while ((line = reader.readNext()) != null) {
-                lineNumber++;
-
-                // Controlla che ci siano abbastanza colonne
-                if (line.length <= Math.max(Math.max(idIndex, nameIndex), dateIndex)) {
-                    System.out.println("  Riga " + lineNumber + ": formato non valido (ignorata)");
-                    continue;
-                }
-
-                String idRaw = line[idIndex].trim();
-                String name = line[nameIndex].trim();
-                String dateIso = line[dateIndex].trim();
-
-                // Verifica che la stringa della data non sia vuota
-                if (dateIso.isEmpty()) {
-                    System.out.println("  Riga " + lineNumber + ": data mancante (ignorata)");
-                    continue;
-                }
-
-                try {
-                    LocalDate date;
-                    if (dateIso.contains("T")) {
-                        // Formato ISO con 'T' (es. 2011-12-07T00:00)
-                        date = LocalDate.parse(dateIso.split("T")[0]);
-                    } else {
-                        // Formato semplice YYYY-MM-DD
-                        date = LocalDate.parse(dateIso);
-                    }
-
-                    releases.add(new ReleaseInfo(idRaw, name, date));
-                    System.out.println("  Riga " + lineNumber + ": aggiunta release " + name + " (" + date + ")");
-                } catch (Exception e) {
-                    System.out.println("  Riga " + lineNumber + ": errore parsing data '" + dateIso + "' - " + e.getMessage());
-                }
-            }
-        } catch (CsvValidationException e) {
-            System.err.println("❌ Errore durante la validazione del CSV: " + e.getMessage());
-        }
-
-        // ordina cronologicamente
-        releases.sort(Comparator.comparing(ReleaseInfo::getDate));
-        return releases;
-    }
-
-    private static void gitCheckout(String projectDir, String version) throws IOException, InterruptedException {
-        // Possibili formati del tag
-        String[] possibleVersions = {
-                version,                 // es. 4.0.0
-                "v" + version,           // es. v4.0.0
-                "release-" + version,    // es. release-4.0.0
-                "bookkeeper-" + version  // es. bookkeeper-4.0.0
-        };
-
-        // Ottieni i tag disponibili riutilizzando il metodo esistente
-        List<String> availableTags = listAvailableTags(projectDir);
-
-        // Mostra i primi 5 tag (se ce ne sono)
-        if (!availableTags.isEmpty()) {
-            List<String> displayTags = availableTags.size() > 5 ? availableTags.subList(0, 5) : availableTags;
-            System.out.println("  Tag disponibili (primi 5): " +
-                    String.join(", ", displayTags) +
-                    (availableTags.size() > 5 ? "... (" + availableTags.size() + " tag totali)" : ""));
-        } else {
-            System.out.println("  Nessun tag disponibile nel repository");
-        }
-
-        // Cerca un tag corrispondente
-        String tagToUse = null;
-        for (String possibleVersion : possibleVersions) {
-            for (String tag : availableTags) {
-                if (tag.equals(possibleVersion) || tag.contains(possibleVersion)) {
-                    tagToUse = tag;
-                    break;
-                }
-            }
-            if (tagToUse != null) break;
-        }
-
-        // Verifica se è stato trovato un tag
-        if (tagToUse == null) {
-            System.out.println("⚠️ Nessun tag trovato per " + version + ", controlla manualmente i tag disponibili");
-            throw new IOException("Nessun tag corrispondente a " + version + " trovato nel repository");
-        } else {
-            System.out.println("✓ Tag trovato: " + tagToUse);
-        }
-
-        // Esegui il checkout
-        ProcessBuilder pb = new ProcessBuilder("git", "checkout", tagToUse);
-        pb.directory(new File(projectDir));
-        pb.redirectErrorStream(true);
-        Process process = pb.start();
-
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                System.out.println("  Git: " + line);
-            }
-        }
-
-        int exitCode = process.waitFor();
-        if (exitCode != 0) {
-            throw new IOException("Errore nel checkout del tag " + tagToUse + " (codice: " + exitCode + ")");
-        } else {
-            System.out.println("✅ Checkout eseguito al tag: " + tagToUse);
-
-            // Attendi un momento per dare tempo al filesystem di aggiornarsi
-            Thread.sleep(500);
         }
     }
 
     /**
-     * Modello per le metriche di ogni metodo
+     * Verifica i file nel repository dopo un checkout
      */
-    private static class MetricRecord {
-        private final String project;
-        private final String methodQualName;
-        private final String release;
-        private final int loc;
-        private final int cbo;
-        private final int wmc;
-        private final int rfc;
-        private final float lcom;
-        private final int dit;
-        private final int noc;
-        private final boolean isLongMethod;
-        private final boolean isGodClass;
-
-        public MetricRecord(String project, String methodQualName, String release, int loc, int cbo, int wmc,
-                            int rfc, float lcom, int dit, int noc, boolean isLongMethod, boolean isGodClass) {
-            this.project = project;
-            this.methodQualName = methodQualName;
-            this.release = release;
-            this.loc = loc;
-            this.cbo = cbo;
-            this.wmc = wmc;
-            this.rfc = rfc;
-            this.lcom = lcom;
-            this.dit = dit;
-            this.noc = noc;
-            this.isLongMethod = isLongMethod;
-            this.isGodClass = isGodClass;
+    private static void verifyRepositoryFiles() {
+        LOG.println("🔍 Contenuto della directory root:");
+        try {
+            Files.list(repoPath)
+                .filter(Files::isDirectory)
+                .limit(10)
+                .forEach(p -> LOG.println("   - [DIR] " + p.getFileName()));
+        } catch (IOException e) {
+            LOG.println("❌ Errore nella lettura delle directory: " + e.getMessage());
         }
 
-        public String[] toStringArray() {
-            return new String[] {
-                    project,
-                    methodQualName,
-                    release,
-                    String.valueOf(loc),
-                    String.valueOf(cbo),
-                    String.valueOf(wmc),
-                    String.valueOf(rfc),
-                    String.valueOf(lcom),
-                    String.valueOf(dit),
-                    String.valueOf(noc),
-                    isLongMethod ? "1" : "0",
-                    isGodClass ? "1" : "0"
-            };
+        LOG.println("🔍 Ricerca file Java (max 10):");
+        try {
+            long javaCount = Files.walk(repoPath, 5)
+                .filter(p -> p.toString().endsWith(".java"))
+                .limit(10)
+                .peek(p -> LOG.println("   - " + p))
+                .count();
+
+            LOG.println("   Trovati " + javaCount + "+ file Java (limitato a 10)");
+        } catch (IOException e) {
+            LOG.println("❌ Errore nella ricerca dei file Java: " + e.getMessage());
         }
     }
 
-    private static void processRelease(ReleaseInfo release, String projectDir, String subDir, String csvPath,
-                                       boolean fileExists) throws IOException {
-        Path root = Path.of(projectDir).resolve(subDir).normalize();
+    /**
+     * Carica le proprietà dal file info.properties
+     */
+    private static void loadProperties() throws IOException {
+        properties = new Properties();
+        Path propertiesPath = Paths.get("src/main/resources/info.properties");
+        LOG.println("🔍 Caricamento properties da: " + propertiesPath.toAbsolutePath());
+        if (!Files.exists(propertiesPath)) {
+            LOG.println("⚠️ File properties non trovato in: " + propertiesPath.toAbsolutePath());
+            // Cerca il file in altre location possibili
+            propertiesPath = Paths.get("info.properties");
+            LOG.println("🔍 Tentativo di caricamento da: " + propertiesPath.toAbsolutePath());
+        }
 
-        System.out.println("🧮 Calcolo metriche per la release " + release.getName() + " in " + root);
+        try (InputStream input = new FileInputStream(propertiesPath.toFile())) {
+            properties.load(input);
+            LOG.println("✅ Properties caricate: " + properties.size() + " proprietà");
+            properties.forEach((k, v) -> LOG.println("   - " + k + " = " + v));
+        }
+    }
 
-        // Prepara il writer CSV per scrivere con OpenCSV
-        try (CSVWriter writer = new CSVWriter(new FileWriter(csvPath, fileExists),
-                ',',
-                CSVWriter.DEFAULT_QUOTE_CHARACTER,
-                CSVWriter.DEFAULT_ESCAPE_CHARACTER,
-                CSVWriter.DEFAULT_LINE_END)) {
-
-            // Se il file non esiste, scriviamo l'intestazione
-            if (!fileExists) {
-                String[] header = {
-                        "project",
-                        "method_qual_name",
-                        "release",
-                        "loc",
-                        "cbo",
-                        "wmc",
-                        "rfc",
-                        "lcom",
-                        "dit",
-                        "noc",
-                        "is_long_method",
-                        "is_god_class"
-                };
-                writer.writeNext(header);
-                System.out.println("📝 File CSV creato con intestazione.");
+    /**
+     * Inizializza il repository Git
+     */
+    private static void initGitRepository() throws IOException {
+        LOG.println("🔍 Ricerca directory Git in: " + repoPath.toFile());
+        File gitDir = new File(repoPath.toFile(), ".git");
+        if (!gitDir.exists()) {
+            LOG.println("⚠️ Directory .git non trovata in " + repoPath.toFile());
+            LOG.println("🔍 Contenuto della directory:");
+            File[] files = repoPath.toFile().listFiles();
+            if (files != null) {
+                for (File file : files) {
+                    LOG.println("   - " + file.getName() + (file.isDirectory() ? "/" : ""));
+                }
             }
+        }
 
-            // Lista temporanea di metriche da scrivere
-            List<MetricRecord> metrics = new ArrayList<>();
+        FileRepositoryBuilder builder = new FileRepositoryBuilder();
+        Repository repository = builder
+                .setGitDir(gitDir)
+                .build();
+        git = new Git(repository);
+        LOG.println("✅ Repository Git inizializzato: " + repository.getDirectory());
+    }
 
-            // CK runner per la versione corrente
-            CK ck = new CK();
-            final String currentRelease = release.getName();
-            final int[] methodCount = {0}; // Contatore per i metodi analizzati
+    /**
+     * Inizializza le metriche del codice
+     */
+    private static void initializeMetrics() {
+        LOG.println("🔄 Configurazione delle metriche...");
 
-            ck.calculate(root.toString(), new CKNotifier() {
-                @Override
-                public void notify(CKClassResult cls) {
-                    for (CKMethodResult m : cls.getMethods()) {
-                        boolean isLongMethod = m.getLoc() > 100;
-                        boolean isGodClass = cls.getWmc() > 47 && cls.getLcom() > 0.8;
+        // Metriche base
+        METRICS.add(new Complexity());
+        LOG.println("✅ Aggiunta metrica: Complexity");
 
-                        // Crea un record per ogni metodo
-                        MetricRecord record = new MetricRecord(
-                                "BOOKKEEPER",
-                                m.getMethodName(),
-                                currentRelease,
-                                m.getLoc(),
-                                cls.getCbo(),
-                                cls.getWmc(),
-                                cls.getRfc(),
-                                cls.getLcom(),
-                                cls.getDit(),
-                                cls.getNoc(),
-                                isLongMethod,
-                                isGodClass
-                        );
+        METRICS.add(new HalsteadVolume());
+        LOG.println("✅ Aggiunta metrica: HalsteadVolume");
 
-                        metrics.add(record);
-                        methodCount[0]++;
+        METRICS.add(new FanIn());
+        LOG.println("✅ Aggiunta metrica: FanIn");
+
+        METRICS.add(new FanOut());
+        LOG.println("✅ Aggiunta metrica: FanOut");
+
+        METRICS.add(new StatementCount());
+        LOG.println("✅ Aggiunta metrica: StatementCount");
+
+        METRICS.add(new nSmells());
+        LOG.println("✅ Aggiunta metrica: nSmells");
+
+        METRICS.add(new DuplicationPercent());
+        LOG.println("✅ Aggiunta metrica: DuplicationPercent");
+
+        // Metriche che utilizzano Git direttamente
+        METRICS.add(new Age(repoPath));
+        LOG.println("✅ Aggiunta metrica: Age");
+
+        METRICS.add(new Churn(repoPath));
+        LOG.println("✅ Aggiunta metrica: Churn");
+
+        METRICS.add(new LOCAdded(repoPath));
+        LOG.println("✅ Aggiunta metrica: LOCAdded");
+
+        METRICS.add(new NAuthors(repoPath));
+        LOG.println("✅ Aggiunta metrica: NAuthors");
+
+        METRICS.add(new MethodHistory(repoPath));
+        LOG.println("✅ Aggiunta metrica: MethodHistory");
+    }
+
+    /**
+     * Estrae le informazioni sulle release dal file releases.csv o utilizza la versione corrente
+     */
+    private static List<ReleaseInfo> extractReleaseInfo() throws IOException {
+        List<ReleaseInfo> releases = new ArrayList<>();
+        Path releasesFile = Paths.get("/Users/iacov/Library/Mobile Documents/com~apple~CloudDocs/BOOKKEEPERVersionInfo.csv");
+        LOG.println("🔍 Cerco file delle release in: " + releasesFile);
+
+        if (!Files.exists(releasesFile)) {
+            LOG.println("⚠️ File delle release non trovato in: " + releasesFile);
+            LOG.println("ℹ️ Utilizzo data corrente e HEAD come versione");
+
+            // Crea una release con la data corrente, usando "HEAD" come ID Git-friendly
+            ReleaseInfo currentRelease = new ReleaseInfo("HEAD", "Current Version", LocalDate.now());
+            releases.add(currentRelease);
+            return releases;
+        }
+
+        LOG.println("✅ File delle release trovato, estrazione dati...");
+
+        // Apri il file delle release
+        try (CSVReader reader = new CSVReaderBuilder(new FileReader(releasesFile.toFile()))
+                .withCSVParser(new CSVParserBuilder().withSeparator(';').build())
+                .build()) {
+
+            String[] line;
+            // Salta l'intestazione
+            reader.readNext();
+            LOG.println("ℹ️ Intestazione saltata");
+
+            int count = 0;
+            while ((line = reader.readNext()) != null) {
+                if (line.length >= 3) {
+                    String id = line[0];
+                    String name = line[1];
+                    LocalDate date = LocalDate.parse(line[2], DATE_FORMATTER);
+
+                    ReleaseInfo release = new ReleaseInfo(id, name, date);
+                    releases.add(release);
+                    count++;
+
+                    if (count <= 5) {
+                        LOG.println("   - Release trovata: " + id + " (" + name + ") del " + date);
+                    } else if (count == 6) {
+                        LOG.println("   - ... altre release ...");
                     }
                 }
-
-                @Override
-                public void notifyError(String sourceFilePath, Exception ex) {
-                    System.err.println("⚠️ CK error su " + sourceFilePath + " → " + ex.getMessage());
-                }
-            });
-
-            // Valida i dati prima della scrittura
-            List<MetricRecord> validatedMetrics = validateMetrics(metrics, currentRelease);
-
-            // Scrive tutte le metriche in un'unica operazione
-            for (MetricRecord metric : validatedMetrics) {
-                writer.writeNext(metric.toStringArray());
             }
 
-            System.out.println("✅ Analizzati " + methodCount[0] + " metodi per la release " + release.getName());
-            System.out.println("📊 Metriche per la release " + release.getName() + " aggiunte al file " + csvPath);
+            LOG.println("✅ Estratte " + count + " release");
+        } catch (CsvValidationException e) {
+            LOG.println("❌ Errore di validazione CSV: " + e.getMessage());
+            e.printStackTrace();
+        }
+
+        // Ordina le release per data
+        releases.sort(Comparator.comparing(ReleaseInfo::getDate));
+        LOG.println("ℹ️ Release ordinate per data");
+        return releases;
+    }
+
+    /**
+     * Crea l'intestazione del file CSV di output
+     */
+    private static void createCsvHeader() throws IOException {
+        LOG.println("🔄 Creazione file CSV: " + outputCsvPath);
+        try (CSVWriter writer = new CSVWriter(new FileWriter(outputCsvPath))) {
+            List<String> header = new ArrayList<>();
+
+            // Colonne di base
+            header.add("project");
+            header.add("package");
+            header.add("class");
+            header.add("method");
+            header.add("release");
+            header.add("release_date");
+            header.add("loc");
+            header.add("cc");
+            LOG.println("ℹ️ Aggiunte colonne di base all'intestazione");
+
+            // Aggiungi i nomi delle metriche personalizzate
+            for (CodeMetric metric : METRICS) {
+                header.add(metric.getName());
+                LOG.println("ℹ️ Aggiunta colonna: " + metric.getName());
+            }
+
+            LOG.println("🔄 Scrittura intestazione con " + header.size() + " colonne");
+            writer.writeNext(header.toArray(new String[0]));
+            LOG.println("✅ Intestazione CSV creata: " + outputCsvPath);
         } catch (Exception e) {
-            System.err.println("❌ Errore durante il calcolo delle metriche: " + e.getMessage());
+            LOG.println("❌ Errore nella creazione dell'intestazione CSV: " + e.getMessage());
             throw e;
         }
     }
 
     /**
-     * Convalida le metriche prima della scrittura
-     * @param metrics Lista di metriche da validare
-     * @param expectedRelease La release attesa
-     * @return Lista di metriche valide
+     * Esegue il checkout di una specifica versione nel repository
      */
-    private static List<MetricRecord> validateMetrics(List<MetricRecord> metrics, String expectedRelease) {
-        List<MetricRecord> validatedMetrics = new ArrayList<>();
+    private static void gitCheckout(String version) throws GitAPIException {
+        LOG.println("🔄 Esecuzione checkout alla versione: " + version);
 
-        for (MetricRecord metric : metrics) {
-            // Verifica che la release sia valida
-            if (!metric.release.equals(expectedRelease)) {
-                continue;
+        try {
+            git.checkout().setName(version).call();
+            LOG.println("✅ Checkout completato con successo per: " + version);
+
+            // Attendi un momento per dare tempo al filesystem di aggiornarsi
+            LOG.println("ℹ️ Attesa per aggiornamento filesystem...");
+            Thread.sleep(1000);
+
+            // Verifica che ci siano file Java dopo il checkout
+            LOG.println("🔍 Conteggio file Java nel repository...");
+            try {
+                long javaFiles = Files.walk(repoPath)
+                    .filter(p -> p.toString().endsWith(".java"))
+                    .count();
+
+                LOG.println("ℹ️ Numero totale di file Java trovati: " + javaFiles);
+
+                if (javaFiles == 0) {
+                    LOG.println("⚠️ ATTENZIONE: Nessun file Java trovato dopo il checkout!");
+                    LOG.println("🔍 Struttura delle directory principali:");
+                    Files.walk(repoPath, 2)
+                        .filter(Files::isDirectory)
+                        .forEach(p -> LOG.println("   - " + p));
+                }
+            } catch (IOException e) {
+                LOG.println("❌ Errore nel conteggio dei file Java: " + e.getMessage());
             }
+        } catch (Exception e) {
+            LOG.println("⚠️ Errore durante il checkout a " + version + ": " + e.getMessage());
+            e.printStackTrace();
 
-            // Verifica che il nome del metodo non sia vuoto o nullo
-            if (metric.methodQualName == null || metric.methodQualName.isEmpty()) {
-                continue;
+            // Se è un InvalidRefNameException, proviamo con HEAD
+            if (e.getMessage() != null && e.getMessage().contains("not allowed")) {
+                LOG.println("🔄 Tentativo di checkout con HEAD...");
+                git.checkout().setName("HEAD").call();
+                LOG.println("✅ Checkout a HEAD completato");
             }
+        }
+    }
 
-            // Verifica che non ci siano valori negativi nelle metriche numeriche
-            if (metric.loc < 0 || metric.cbo < 0 || metric.wmc < 0 ||
-                    metric.rfc < 0 || metric.dit < 0 || metric.noc < 0) {
-                continue;
+    /**
+     * Analizza una release e scrive i risultati nel file CSV
+     */
+    private static void analyzeRelease(ReleaseInfo release) throws IOException {
+        LOG.println("\n🔍 INIZIO ANALISI RELEASE: " + release.getName() + " (" + release.getDate() + ")");
+        LOG.println("📁 Path repository: " + repoPath.toAbsolutePath());
+
+        // Cerca la directory del codice sorgente Java
+        Path srcPath = findSourceDirectory(repoPath);
+        LOG.println("📁 Directory sorgente identificata: " + srcPath);
+
+        // Usa append=true per aggiungere al CSV esistente
+        LOG.println("🔄 Apertura file CSV per aggiunta dati: " + outputCsvPath);
+        try (CSVWriter writer = new CSVWriter(new FileWriter(outputCsvPath, true))) {
+            // Contatore per le classi e i metodi analizzati
+            final int[] classCounter = {0};
+            final int[] methodCounter = {0};
+
+            // Esegui l'analisi CK sulla directory sorgente
+            LOG.println("🔄 Avvio analisi CK su: " + srcPath);
+            LOG.println("⏳ Attendere mentre la libreria CK analizza i file...");
+
+            new CK().calculate(srcPath.toString(), new CKNotifier() {
+                @Override
+                public void notify(CKClassResult cls) {
+                    classCounter[0]++;
+
+                    if (classCounter[0] % 10 == 0 || classCounter[0] <= 5) {
+                        LOG.println("✅ #" + classCounter[0] + " Classe analizzata: " + cls.getClassName() +
+                                  " con " + cls.getMethods().size() + " metodi");
+                    }
+
+                    for (CKMethodResult method : cls.getMethods()) {
+                        methodCounter[0]++;
+                        processMethod(writer, method, cls, release);
+
+                        // Ogni 100 metodi, fai un flush del writer per evitare perdite
+                        if (methodCounter[0] % 100 == 0) {
+                            try {
+                                writer.flush();
+                                LOG.println("💾 Salvataggio intermedio dopo " + methodCounter[0] + " metodi");
+                            } catch (IOException e) {
+                                LOG.println("⚠️ Errore durante il salvataggio intermedio: " + e.getMessage());
+                            }
+                        }
+                    }
+                }
+
+                @Override
+                public void notifyError(String sourceFilePath, Exception e) {
+                    LOG.println("⚠️ Errore nell'analisi di " + sourceFilePath + ": " + e.getMessage());
+                }
+            });
+
+            LOG.println("✅ ANALISI COMPLETATA: " + classCounter[0] + " classi e " +
+                    methodCounter[0] + " metodi elaborati per la release: " + release.getName());
+
+            if (classCounter[0] == 0) {
+                LOG.println("⚠️ ATTENZIONE: Nessuna classe trovata! Verifica il percorso e la versione Git.");
+                LOG.println("🔍 Path utilizzato per l'analisi: " + srcPath.toAbsolutePath());
             }
+        } catch (Exception e) {
+            LOG.println("❌ Errore critico durante l'analisi della release: " + e.getMessage());
+            e.printStackTrace();
+            throw new IOException("Errore nell'analisi della release " + release.getName(), e);
+        }
+    }
 
-            validatedMetrics.add(metric);
+    /**
+     * Trova la directory del codice sorgente Java all'interno del repository
+     */
+    private static List<Path> findAllSourceDirectories(Path repoPath) {
+        LOG.println("🔍 Ricerca approfondita di tutte le directory con file Java...");
+        List<Path> sourceDirs = new ArrayList<>();
+
+        try {
+            // Cerca in tutti i sotto-moduli le directory src/main/java tipiche di Maven
+            Files.walk(repoPath, 4)
+                    .filter(path -> path.toString().endsWith("/src/main/java") && Files.isDirectory(path))
+                    .forEach(dir -> {
+                        try {
+                            // Verifica che contenga file Java
+                            boolean hasJavaFiles = Files.walk(dir, 1)
+                                    .anyMatch(p -> p.toString().endsWith(".java"));
+
+                            if (hasJavaFiles) {
+                                LOG.println("✅ Trovata directory con file Java: " + dir);
+                                sourceDirs.add(dir);
+                            }
+                        } catch (IOException e) {
+                            LOG.println("⚠️ Errore nella ricerca di file Java: " + e.getMessage());
+                        }
+                    });
+
+            if (sourceDirs.isEmpty()) {
+                LOG.println("⚠️ Nessuna directory src/main/java trovata, cerco file .java in generale");
+                // Ricerca più generica
+                Files.walk(repoPath, 10)
+                        .filter(path -> path.toString().endsWith(".java"))
+                        .map(Path::getParent)
+                        .distinct()
+                        .forEach(dir -> {
+                            LOG.println("✅ Trovata directory con file Java: " + dir);
+                            sourceDirs.add(dir);
+                        });
+            }
+        } catch (IOException e) {
+            LOG.println("❌ Errore nella ricerca di directory Java: " + e.getMessage());
         }
 
-        System.out.println("ℹ️ Validazione: " + validatedMetrics.size() + " metriche valide su " + metrics.size() + " totali");
-        return validatedMetrics;
+        if (sourceDirs.isEmpty()) {
+            LOG.println("⚠️ Nessuna directory con file Java trovata, utilizzo il percorso base");
+            sourceDirs.add(repoPath);
+        } else {
+            LOG.println("✅ Trovate " + sourceDirs.size() + " directory con file Java");
+        }
+
+        return sourceDirs;
+    }
+    /**
+     * Elabora un singolo metodo e scrive i suoi dati nel file CSV
+     */
+    private static void processMethod(CSVWriter writer, CKMethodResult method, CKClassResult cls, ReleaseInfo release) {
+        try {
+            // Costruisci la chiave univoca per il metodo
+            String methodKey = cls.getClassName() + "." + method.getMethodName();
+
+            // Non loggare ogni metodo per evitare output eccessivo
+            // Solo per metodo specifici (ad esempio uno ogni 50) o primi 5
+            boolean shouldLog = methodKey.hashCode() % 50 == 0 ||
+                              METHOD_HISTORIES.size() < 5;
+
+            if (shouldLog) {
+                LOG.println("🔄 Elaborazione metodo: " + methodKey);
+            }
+
+            // Inizializza la history del metodo se non esiste
+            METHOD_HISTORIES.putIfAbsent(methodKey, new MethodHistoryData());
+
+            // Se questa è la prima volta che vediamo questo metodo, registra la data
+            MethodHistoryData history = METHOD_HISTORIES.get(methodKey);
+            if (history.getFirstSeen() == null) {
+                history.setFirstSeen(release.getDate());
+            }
+
+            // Estrai package e nome classe
+            String packageName = "";
+            String className = cls.getClassName();
+            int lastDot = className.lastIndexOf(".");
+            if (lastDot > 0) {
+                packageName = className.substring(0, lastDot);
+                className = className.substring(lastDot + 1);
+            }
+
+            // Prepara i valori per il CSV
+            List<String> values = new ArrayList<>();
+
+            // Informazioni di base
+            String projectName = properties.getProperty("info.name", "bookkeeper");
+            values.add(projectName);                           // project
+            values.add(packageName);                           // package
+            values.add(className);                             // class
+            values.add(method.getMethodName());                // method
+            values.add(release.getName());                     // release
+            values.add(release.getDate().format(DATE_FORMATTER)); // release_date
+
+            // Metriche CK standard
+            int loc = method.getLoc();
+            int cc = method.getWmc();
+            values.add(String.valueOf(loc));                   // loc
+            values.add(String.valueOf(cc));                    // cc
+
+            if (shouldLog) {
+                LOG.println("📊 Metriche di base: LOC=" + loc + ", CC=" + cc);
+            }
+
+            // Calcola e aggiungi le metriche personalizzate
+            for (CodeMetric metric : METRICS) {
+                try {
+                    String metricName = metric.getName();
+
+                    if (shouldLog) {
+                        LOG.println("🧮 Calcolo " + metricName + "...");
+                    }
+
+                    Object result = metric.calculate(method, cls, repoPath);
+                    String resultStr = (result != null) ? result.toString() : "0";
+
+                    if (shouldLog) {
+                        LOG.println("✅ " + metricName + " = " + resultStr);
+                    }
+
+                    values.add(resultStr);
+                } catch (Exception e) {
+                    if (shouldLog) {
+                        LOG.println("⚠️ Errore nel calcolo della metrica " + metric.getName() + ": " + e.getMessage());
+                    }
+                    values.add("0"); // Valore di default in caso di errore
+                }
+            }
+
+            // Scrivi la riga nel CSV
+            writer.writeNext(values.toArray(new String[0]));
+
+            if (shouldLog) {
+                LOG.println("✅ Riga CSV scritta per: " + methodKey);
+            }
+        } catch (Exception e) {
+            LOG.println("⚠️ ERRORE nell'elaborazione del metodo " +
+                      cls.getClassName() + "." + method.getMethodName() + ": " + e.getMessage());
+        }
     }
 }
