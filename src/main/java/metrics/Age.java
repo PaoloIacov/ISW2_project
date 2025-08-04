@@ -2,6 +2,9 @@ package metrics;
 
 import com.github.mauricioaniche.ck.CKClassResult;
 import com.github.mauricioaniche.ck.CKMethodResult;
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.MethodDeclaration;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.Repository;
@@ -10,46 +13,30 @@ import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.Path;
+import java.nio.file.*;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
 
 /**
- * Implementazione della metrica Age che misura l'età di un metodo in settimane.
- * L'età viene calcolata dalla prima apparizione del metodo fino alla data corrente
- * utilizzando direttamente la storia del repository Git.
+ * Calcola la metrica Age per ogni metodo: settimane dalla prima apparizione a oggi.
  */
 public class Age implements CodeMetric {
 
     private final Path repoPath;
-    private Map<String, LocalDate> firstAppearanceCache;
     private final LocalDate currentDate;
+    private Map<String, LocalDate> firstAppearanceCache;
     private boolean cacheInitialized = false;
 
-    /**
-     * Costruttore che inizializza il calcolatore dell'età dei metodi.
-     *
-     * @param repoPath la directory del repository Git
-     */
     public Age(Path repoPath) {
-        this.repoPath = repoPath;
-        this.firstAppearanceCache = new HashMap<>();
-        this.currentDate = LocalDate.now();
+        this(repoPath, LocalDate.now());
     }
 
-    /**
-     * Costruttore con data personalizzata, utile per i test.
-     *
-     * @param repoPath la directory del repository Git
-     * @param currentDate la data corrente da utilizzare per i calcoli
-     */
     public Age(Path repoPath, LocalDate currentDate) {
         this.repoPath = repoPath;
-        this.firstAppearanceCache = new HashMap<>();
         this.currentDate = currentDate;
+        this.firstAppearanceCache = new HashMap<>();
     }
 
     @Override
@@ -59,87 +46,106 @@ public class Age implements CodeMetric {
 
     @Override
     public Integer calculate(CKMethodResult method, CKClassResult cls, Path root) {
-        // Se la cache non è inizializzata, inizializzala
         if (!cacheInitialized) {
             identifyFirstAppearanceDates();
             cacheInitialized = true;
         }
 
-        // Costruisce la chiave di identificazione del metodo
-        String methodKey = cls.getClassName() + "." + method.getMethodName();
+        String methodKey = buildMethodKey(cls, method);
 
-        // Se il metodo non è nella cache, usa la data corrente
-        if (!firstAppearanceCache.containsKey(methodKey)) {
-            firstAppearanceCache.put(methodKey, currentDate);
-        }
-
-        // Calcola l'età in settimane
-        LocalDate firstAppearance = firstAppearanceCache.get(methodKey);
+        // Se il metodo non è in cache, viene considerato nato oggi
+        LocalDate firstAppearance = firstAppearanceCache.getOrDefault(methodKey, currentDate);
         long weeks = ChronoUnit.WEEKS.between(firstAppearance, currentDate);
-
-        // Assicura che l'età sia almeno 0 (anche se la data è nel futuro)
         return (int) Math.max(0, weeks);
     }
 
     /**
-     * Identifica le date di prima apparizione di tutti i metodi analizzando
-     * la storia dei commit del repository Git.
+     * Costruisce una chiave univoca per il metodo
+     */
+    private String buildMethodKey(CKClassResult cls, CKMethodResult method) {
+        return cls.getClassName() + "." + method.getMethodName() + "/" + method.getParametersQty();
+    }
+
+    /**
+     * Scorre tutti i commit (dal più vecchio), estrae i metodi e aggiorna la cache della prima apparizione.
      */
     private void identifyFirstAppearanceDates() {
+        Repository repository = null;
+        Git git = null;
+        String originalBranch = null;
+
         try {
-            // Apri il repository Git
             FileRepositoryBuilder builder = new FileRepositoryBuilder();
-            Repository repository = builder
-                    .setGitDir(new File(repoPath.toFile(), ".git"))
+            repository = builder.setGitDir(new File(repoPath.toFile(), ".git"))
+                    .readEnvironment()
+                    .findGitDir()
                     .build();
+            git = new Git(repository);
 
-            // Crea un'istanza di Git
-            try (Git git = new Git(repository)) {
-                // Ottieni tutti i commit, dal più recente al più vecchio
-                Iterable<RevCommit> commits = git.log().call();
+            // Salva il branch corrente per poi tornarci
+            originalBranch = repository.getBranch();
 
-                // Inverti l'ordine per analizzare dal più vecchio al più recente
-                // (Nota: questa è una semplificazione, normalmente dovresti usare un approccio più efficiente)
-                Map<String, LocalDate> methodFirstAppearance = new HashMap<>();
+            // Ordina i commit dal più vecchio al più recente
+            List<RevCommit> commits = new ArrayList<>();
+            for (RevCommit c : git.log().all().call()) {
+                commits.add(c);
+            }
+            commits.sort(Comparator.comparingInt(RevCommit::getCommitTime)); // più vecchio prima
 
-                for (RevCommit commit : commits) {
-                    // Converti la data del commit in LocalDate
-                    LocalDate commitDate = commit.getAuthorIdent().getWhen().toInstant()
-                            .atZone(ZoneId.systemDefault())
-                            .toLocalDate();
+            for (RevCommit commit : commits) {
+                // Checkout del commit
+                git.checkout().setName(commit.getName()).call();
 
-                    // Per ogni commit, puoi usare git.checkout() per estrarre il codice
-                    // e poi analizzarlo, ma questa operazione è costosa.
-                    // Una soluzione più efficiente sarebbe usare Git API per ottenere
-                    // i file modificati in ogni commit e analizzare solo quelli.
+                LocalDate commitDate = commit.getAuthorIdent().getWhen().toInstant()
+                        .atZone(ZoneId.systemDefault())
+                        .toLocalDate();
 
-                    // Esempio semplificato (questa parte dovrebbe essere ottimizzata in produzione):
-                    git.checkout().setName(commit.getName()).call();
+                // Scansiona tutti i file .java
+                List<Path> javaFiles = getAllJavaFiles(repoPath);
 
-                    // Qui dovresti analizzare tutti i file Java nel repository
-                    // e registrare i metodi trovati con la data del commit
-                    // se non sono già stati registrati in precedenza
+                for (Path javaFile : javaFiles) {
+                    try {
+                        CompilationUnit cu = StaticJavaParser.parse(javaFile);
+                        cu.findAll(MethodDeclaration.class).forEach(md -> {
+                            String className = md.findAncestor(com.github.javaparser.ast.body.ClassOrInterfaceDeclaration.class)
+                                    .map(c -> c.getNameAsString())
+                                    .orElse("UnknownClass");
+                            int paramQty = md.getParameters().size();
+                            String methodKey = className + "." + md.getNameAsString() + "/" + paramQty;
 
-                    // Questo è un placeholder per il codice che analizza i file Java
-                    // nel repository e aggiorna methodFirstAppearance
-                    // ...
-
-                    // Dopo l'analisi, merge la mappa temporanea nella cache principale
-                    for (Map.Entry<String, LocalDate> entry : methodFirstAppearance.entrySet()) {
-                        firstAppearanceCache.putIfAbsent(entry.getKey(), entry.getValue());
+                            // Se mai visto prima, salva la data
+                            firstAppearanceCache.putIfAbsent(methodKey, commitDate);
+                        });
+                    } catch (Exception e) {
+                        // File non parsabile o altro errore: ignora
                     }
                 }
-
-                // Ritorna al branch principale (master o main)
-                try {
-                    git.checkout().setName("main").call();
-                } catch (Exception e) {
-                    git.checkout().setName("master").call();
-                }
             }
+
         } catch (IOException | GitAPIException e) {
             e.printStackTrace();
-            // In caso di errore, la cache rimarrà vuota e verrà utilizzata la data corrente per l'età
+        } finally {
+            // Torna al branch di partenza (main/master)
+            if (git != null && originalBranch != null) {
+                try {
+                    git.checkout().setName(originalBranch).call();
+                } catch (Exception e) {
+                    // fallback silenzioso
+                }
+            }
+            if (repository != null) repository.close();
+            if (git != null) git.close();
         }
+    }
+
+    /**
+     * Ritorna la lista di tutti i file .java nel repo checkoutato
+     */
+    private List<Path> getAllJavaFiles(Path repoRoot) throws IOException {
+        List<Path> files = new ArrayList<>();
+        Files.walk(repoRoot)
+                .filter(p -> p.toString().endsWith(".java"))
+                .forEach(files::add);
+        return files;
     }
 }

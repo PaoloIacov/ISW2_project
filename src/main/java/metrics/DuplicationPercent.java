@@ -5,31 +5,25 @@ import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.mauricioaniche.ck.CKClassResult;
 import com.github.mauricioaniche.ck.CKMethodResult;
-import utils.SourceCodeExtractor;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Implementazione della metrica DuplicationPercent che calcola la percentuale
- * di codice duplicato in un metodo rispetto al resto del progetto.
+ * Metrica: percentuale di righe duplicate in un metodo rispetto al resto del progetto.
+ * Versione migliorata: esclude chunk del metodo stesso, usa hashing per velocità.
  */
 public class DuplicationPercent implements CodeMetric {
 
     private static final int MIN_CHUNK_SIZE = 5; // Minimo numero di righe per considerare una duplicazione
-    private Map<String, Double> duplicationsCache;
-    private List<String[]> allCodeChunks;
+    private Map<String, Double> duplicationsCache = new HashMap<>();
+    private Map<String, Integer> chunkFrequency = new HashMap<>();
+    private Map<String, Set<String>> methodChunks = new HashMap<>(); // methodKey → set di chunk string
 
-    public DuplicationPercent() {
-        this.duplicationsCache = new HashMap<>();
-        this.allCodeChunks = new ArrayList<>();
-    }
+    public DuplicationPercent() {}
 
     @Override
     public String getName() {
@@ -38,76 +32,70 @@ public class DuplicationPercent implements CodeMetric {
 
     @Override
     public Double calculate(CKMethodResult method, CKClassResult cls, Path root) {
-        // Se la cache è vuota, inizializza l'analisi
-        if (allCodeChunks.isEmpty()) {
-            initializeCodeChunks(root);
+        // Popola cache e chunk solo una volta
+        if (chunkFrequency.isEmpty()) {
+            initializeChunkFrequencies(root);
         }
 
-        // Costruisce la chiave di identificazione del metodo
-        String methodKey = cls.getClassName() + "." + method.getMethodName();
-
-        // Se abbiamo già calcolato la duplicazione per questo metodo, restituiscila
+        String methodKey = cls.getClassName() + "." + method.getMethodName() + "/" + method.getParametersQty();
         if (duplicationsCache.containsKey(methodKey)) {
             return duplicationsCache.get(methodKey);
         }
 
-        // Ottieni il codice sorgente del metodo
-        String methodSource = SourceCodeExtractor.getMethodSource(method, root);
-        if (methodSource == null || methodSource.isEmpty()) {
-            return 0.0; // Se non riusciamo a ottenere il codice, restituisci 0%
-        }
-
-        // Dividi il metodo in righe e rimuovi gli spazi, le righe vuote e i commenti
-        String[] methodLines = normalizeCode(methodSource);
-
-        // Se il metodo ha meno righe del minimo per considerare una duplicazione, restituisci 0%
-        if (methodLines.length < MIN_CHUNK_SIZE) {
+        Set<String> methodChunkSet = methodChunks.getOrDefault(methodKey, Collections.emptySet());
+        int totalChunks = methodChunkSet.size();
+        if (totalChunks == 0) {
             duplicationsCache.put(methodKey, 0.0);
             return 0.0;
         }
 
-        // Calcola la percentuale di codice duplicato
-        double duplicationPercent = calculateDuplication(methodLines);
+        int duplicatedChunks = 0;
+        for (String chunk : methodChunkSet) {
+            if (chunkFrequency.getOrDefault(chunk, 0) > 1) {
+                duplicatedChunks++;
+            }
+        }
 
-        // Memorizza il risultato nella cache
+        double duplicationPercent = ((double) duplicatedChunks / totalChunks) * 100.0;
         duplicationsCache.put(methodKey, duplicationPercent);
-
         return duplicationPercent;
     }
 
     /**
-     * Inizializza i chunk di codice da tutto il progetto per il confronto
+     * Estrae e indicizza tutti i chunk di codice di tutti i metodi del progetto.
      */
-    private void initializeCodeChunks(Path root) {
+    private void initializeChunkFrequencies(Path root) {
         try {
-            // Trova tutti i file Java nel progetto
             List<Path> javaFiles = Files.walk(root)
-                .filter(p -> p.toString().endsWith(".java"))
-                .collect(Collectors.toList());
+                    .filter(p -> p.toString().endsWith(".java"))
+                    .collect(Collectors.toList());
 
-            // Per ogni file, estrai i metodi e i loro chunk di codice
             for (Path file : javaFiles) {
+                CompilationUnit cu;
                 try {
-                    CompilationUnit cu = StaticJavaParser.parse(file);
+                    cu = StaticJavaParser.parse(file);
+                } catch (Exception e) {
+                    continue; // ignora file non parsabili
+                }
+                cu.findAll(MethodDeclaration.class).forEach(md -> {
+                    String className = md.findAncestor(com.github.javaparser.ast.body.ClassOrInterfaceDeclaration.class)
+                            .map(c -> c.getNameAsString())
+                            .orElse("UnknownClass");
+                    int paramQty = md.getParameters().size();
+                    String methodKey = className + "." + md.getNameAsString() + "/" + paramQty;
 
-                    // Trova tutti i metodi e estrai i loro chunk di codice
-                    cu.findAll(MethodDeclaration.class).forEach(md -> {
-                        if (md.getBody().isPresent()) {
-                            String[] lines = normalizeCode(md.getBody().get().toString());
-
-                            // Aggiungi chunk di MIN_CHUNK_SIZE righe consecutive
-                            if (lines.length >= MIN_CHUNK_SIZE) {
-                                for (int i = 0; i <= lines.length - MIN_CHUNK_SIZE; i++) {
-                                    String[] chunk = new String[MIN_CHUNK_SIZE];
-                                    System.arraycopy(lines, i, chunk, 0, MIN_CHUNK_SIZE);
-                                    allCodeChunks.add(chunk);
-                                }
+                    if (md.getBody().isPresent()) {
+                        String[] lines = normalizeCode(md.getBody().get().toString());
+                        if (lines.length >= MIN_CHUNK_SIZE) {
+                            Set<String> chunkSet = methodChunks.computeIfAbsent(methodKey, k -> new HashSet<>());
+                            for (int i = 0; i <= lines.length - MIN_CHUNK_SIZE; i++) {
+                                String chunk = serializeChunk(lines, i, MIN_CHUNK_SIZE);
+                                chunkSet.add(chunk);
+                                chunkFrequency.put(chunk, chunkFrequency.getOrDefault(chunk, 0) + 1);
                             }
                         }
-                    });
-                } catch (Exception e) {
-                    // Ignora i file che non possono essere analizzati
-                }
+                    }
+                });
             }
         } catch (IOException e) {
             e.printStackTrace();
@@ -115,79 +103,27 @@ public class DuplicationPercent implements CodeMetric {
     }
 
     /**
-     * Normalizza il codice rimuovendo spazi, commenti e righe vuote
+     * Serializza un chunk di codice in una stringa unica
+     */
+    private String serializeChunk(String[] lines, int start, int length) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = start; i < start + length; i++) {
+            sb.append(lines[i]).append("\n");
+        }
+        return sb.toString().trim();
+    }
+
+    /**
+     * Normalizza il codice rimuovendo commenti, spazi, e righe vuote.
      */
     private String[] normalizeCode(String code) {
-        // Rimuovi commenti
+        // Rimuove commenti inline e multilinea
         code = code.replaceAll("//.*|/\\*[\\s\\S]*?\\*/", "");
-
-        // Dividi in righe e normalizza
+        // Divide in righe, rimuove spazi extra, filtra righe vuote
         return code.lines()
-            .map(String::trim)
-            .filter(line -> !line.isEmpty())
-            .map(line -> line.replaceAll("\\s+", " ")) // Normalizza spazi multipli
-            .toArray(String[]::new);
-    }
-
-    /**
-     * Calcola la percentuale di duplicazione per le righe del metodo
-     */
-    private double calculateDuplication(String[] methodLines) {
-        if (methodLines.length == 0) {
-            return 0.0;
-        }
-
-        int totalLines = methodLines.length;
-        int duplicatedLines = 0;
-
-        // Per ogni possibile chunk nel metodo, verifica se è presente altrove
-        for (int i = 0; i <= methodLines.length - MIN_CHUNK_SIZE; i++) {
-            String[] chunk = new String[MIN_CHUNK_SIZE];
-            System.arraycopy(methodLines, i, chunk, 0, MIN_CHUNK_SIZE);
-
-            // Verifica se questo chunk è duplicato altrove
-            if (isDuplicated(chunk)) {
-                duplicatedLines++;
-            }
-        }
-
-        // Calcola la percentuale, tenendo conto che ogni riga può essere contata più volte
-        return Math.min(100.0, (double) duplicatedLines / (totalLines - MIN_CHUNK_SIZE + 1) * 100.0);
-    }
-
-    /**
-     * Verifica se un chunk di codice è duplicato in altri metodi
-     */
-    private boolean isDuplicated(String[] chunk) {
-        // Controlla se questo chunk appare più di una volta nella collezione di tutti i chunk
-        int occurrences = 0;
-
-        for (String[] otherChunk : allCodeChunks) {
-            if (areChunksEqual(chunk, otherChunk)) {
-                occurrences++;
-                if (occurrences > 1) {
-                    return true; // Trovata almeno una duplicazione
-                }
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * Confronta due chunk di codice per determinare se sono uguali
-     */
-    private boolean areChunksEqual(String[] chunk1, String[] chunk2) {
-        if (chunk1.length != chunk2.length) {
-            return false;
-        }
-
-        for (int i = 0; i < chunk1.length; i++) {
-            if (!chunk1[i].equals(chunk2[i])) {
-                return false;
-            }
-        }
-
-        return true;
+                .map(String::trim)
+                .filter(line -> !line.isEmpty())
+                .map(line -> line.replaceAll("\\s+", " ")) // Normalizza spazi multipli
+                .toArray(String[]::new);
     }
 }

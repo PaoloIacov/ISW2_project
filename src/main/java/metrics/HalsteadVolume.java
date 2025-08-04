@@ -1,113 +1,214 @@
 package metrics;
 
-import com.github.javaparser.StaticJavaParser;
-import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.Node;
-import com.github.javaparser.ast.expr.*;
-import com.github.javaparser.ast.stmt.*;
 import com.github.mauricioaniche.ck.CKClassResult;
 import com.github.mauricioaniche.ck.CKMethodResult;
-import utils.SourceCodeExtractor;
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.*;
+import com.github.javaparser.ast.stmt.*;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.HashSet;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.*;
 
+/**
+ * Classe che implementa il calcolo della metrica HalsteadVolume.
+ * Il volume di Halstead è calcolato come V = N * log2(n), dove:
+ * - n è il vocabolario del programma (operatori unici + operandi unici)
+ * - N è la lunghezza del programma (totale operatori + totale operandi)
+ */
 public class HalsteadVolume implements CodeMetric {
+
+    private final Map<String, Double> cache = new HashMap<>();
+
     @Override
     public String getName() {
         return "HalsteadVolume";
     }
 
     @Override
-    public Integer calculate(CKMethodResult method, CKClassResult cls, Path root) {
-        String sourceCode = SourceCodeExtractor.getMethodSource(method, root);
+    public Double calculate(CKMethodResult method, CKClassResult cls, Path root) {
+        // Uso di getParameters() invece di getParameterCount()
+        String methodKey = cls.getClassName() + "#" + method.getMethodName() + method.getParametersQty();
 
-        if (sourceCode == null || sourceCode.isEmpty()) {
-            return 0;
+        // Usa la cache se il metodo è già stato analizzato
+        if (cache.containsKey(methodKey)) {
+            return cache.get(methodKey);
         }
 
         try {
-            // Parsiamo il codice usando JavaParser
-            CompilationUnit cu = StaticJavaParser.parse("class Temp { " + sourceCode + " }");
+            // Trova il file sorgente
+            String filePath = cls.getFile();
+            if (filePath == null) {
+                return 0.0;
+            }
 
-            // Contatori per operandi e operatori
-            Set<String> uniqueOperators = new HashSet<>();
-            Set<String> uniqueOperands = new HashSet<>();
+            // Analizza il file e trova la dichiarazione del metodo
+            CompilationUnit cu = StaticJavaParser.parse(Files.readString(Path.of(filePath)));
+            Optional<MethodDeclaration> methodDecl = findMethod(cu, method);
 
-            // Utilizziamo AtomicInteger per permettere la modifica all'interno delle lambda
-            AtomicInteger totalOperators = new AtomicInteger(0);
-            AtomicInteger totalOperands = new AtomicInteger(0);
+            if (methodDecl.isPresent()) {
+                // Calcola le metriche di Halstead
+                HalsteadCounter counter = new HalsteadCounter();
+                methodDecl.get().accept(counter, null);
 
-            // Visitiamo l'AST per contare operatori e operandi
-            cu.walk(Node.TreeTraversal.PREORDER, node -> {
-                if (node instanceof BinaryExpr expr) {
-                    String operator = expr.getOperator().asString();
-                    uniqueOperators.add(operator);
-                    totalOperators.incrementAndGet();
+                int distinctOperators = counter.getDistinctOperators().size();
+                int distinctOperands = counter.getDistinctOperands().size();
+                int totalOperators = counter.getTotalOperators();
+                int totalOperands = counter.getTotalOperands();
+
+                // Calcola il volume di Halstead
+                int vocabulary = distinctOperators + distinctOperands;
+                int length = totalOperators + totalOperands;
+
+                double volume = 0.0;
+                if (vocabulary > 0 && length > 0) {
+                    volume = length * (Math.log(vocabulary) / Math.log(2));
                 }
-                // Operatori unari (es. ++, --, !, ecc.)
-                else if (node instanceof UnaryExpr expr) {
-                    String operator = expr.getOperator().asString();
-                    uniqueOperators.add(operator);
-                    totalOperators.incrementAndGet();
-                }
-                // Assegnazioni (=, +=, -=, ecc.)
-                else if (node instanceof AssignExpr expr) {
-                    String operator = expr.getOperator().asString();
-                    uniqueOperators.add(operator);
-                    totalOperators.incrementAndGet();
-                }
-                // Costrutti di controllo (if, for, while, ecc.)
-                else if (node instanceof IfStmt || node instanceof ForStmt ||
-                        node instanceof WhileStmt || node instanceof DoStmt ||
-                        node instanceof SwitchStmt) {
-                    String nodeType = node.getClass().getSimpleName().replace("Stmt", "");
-                    uniqueOperators.add(nodeType);
-                    totalOperators.incrementAndGet();
-                }
-                // Identificatori (variabili, nomi di metodi)
-                else if (node instanceof NameExpr expr) {
-                    String name = expr.getNameAsString();
-                    uniqueOperands.add(name);
-                    totalOperands.incrementAndGet();
-                }
-                // Chiamate di metodo
-                else if (node instanceof MethodCallExpr expr) {
-                    String methodName = expr.getNameAsString();
-                    uniqueOperands.add(methodName);
-                    totalOperands.incrementAndGet();
 
-                    // Il nome del metodo è un operatore
-                    uniqueOperators.add("call");
-                    totalOperators.incrementAndGet();
-                }
-                // Letterali (numeri, stringhe, booleani)
-                else if (node instanceof LiteralExpr expr) {
-                    String literal = expr.toString();
-                    uniqueOperands.add(literal);
-                    totalOperands.incrementAndGet();
-                }
-            });
+                cache.put(methodKey, volume);
+                return volume;
+            }
+        } catch (IOException e) {
+            System.err.println("Errore nell'analisi del metodo " + methodKey + ": " + e.getMessage());
+        }
 
-            // Calcolo del volume di Halstead
-            // Formula: N * log2(n)
-            // dove: N = operandi totali + operatori totali
-            //       n = operandi unici + operatori unici
-            int N = totalOperands.get() + totalOperators.get();
-            int n = uniqueOperands.size() + uniqueOperators.size();
+        return 0.0;
+    }
 
-            if (n <= 1) return 0;
+    /**
+     * Trova la dichiarazione del metodo nell'albero AST
+     */
+    private Optional<MethodDeclaration> findMethod(CompilationUnit cu, CKMethodResult method) {
+        return cu.findAll(MethodDeclaration.class).stream()
+                .filter(md -> md.getNameAsString().equals(method.getMethodName())
+                        // Controllo più generico sui parametri
+                        && md.getParameters().size() == method.getParametersQty())
+                .findFirst();
+    }
 
-            // Usa logaritmo in base 2
-            double volume = N * (Math.log(n) / Math.log(2));
+    /**
+     * Visitor per contare operatori e operandi
+     */
+    private static class HalsteadCounter extends com.github.javaparser.ast.visitor.VoidVisitorAdapter<Void> {
+        private final Set<String> distinctOperators = new HashSet<>();
+        private final Set<String> distinctOperands = new HashSet<>();
+        private int totalOperators = 0;
+        private int totalOperands = 0;
 
-            return (int) Math.round(volume);
+        public Set<String> getDistinctOperators() {
+            return distinctOperators;
+        }
 
-        } catch (Exception e) {
-            System.err.println("Errore durante il calcolo del volume di Halstead: " + e.getMessage());
-            return 0;
+        public Set<String> getDistinctOperands() {
+            return distinctOperands;
+        }
+
+        public int getTotalOperators() {
+            return totalOperators;
+        }
+
+        public int getTotalOperands() {
+            return totalOperands;
+        }
+
+        // Operatori binari (+=, +, -, *, etc.)
+        @Override
+        public void visit(BinaryExpr n, Void arg) {
+            String operator = n.getOperator().asString();
+            distinctOperators.add(operator);
+            totalOperators++;
+            super.visit(n, arg);
+        }
+
+        // Operatori unari (++, --, !, etc.)
+        @Override
+        public void visit(UnaryExpr n, Void arg) {
+            String operator = n.getOperator().asString();
+            distinctOperators.add(operator);
+            totalOperators++;
+            super.visit(n, arg);
+        }
+
+        // Variabili e nomi
+        @Override
+        public void visit(NameExpr n, Void arg) {
+            String name = n.getNameAsString();
+            distinctOperands.add(name);
+            totalOperands++;
+            super.visit(n, arg);
+        }
+
+        // Letterali (numeri, stringhe, etc.)
+        // Rimuoviamo @Override poiché non è effettivamente un metodo sovrascritto
+        public void visit(LiteralExpr n, Void arg) {
+            String literal = n.toString();
+            distinctOperands.add(literal);
+            totalOperands++;
+            // Per gestire tutti i tipi di LiteralExpr
+            if (n instanceof IntegerLiteralExpr || n instanceof DoubleLiteralExpr ||
+                    n instanceof StringLiteralExpr || n instanceof BooleanLiteralExpr ||
+                    n instanceof CharLiteralExpr) {
+                // Già conteggiato sopra
+            }
+        }
+
+        // Chiamate di metodo
+        @Override
+        public void visit(MethodCallExpr n, Void arg) {
+            String methodName = n.getNameAsString();
+            distinctOperators.add("call");
+            distinctOperands.add(methodName);
+            totalOperators++;
+            totalOperands++;
+            super.visit(n, arg);
+        }
+
+        // Controllo di flusso (if, for, while, etc.)
+        @Override
+        public void visit(IfStmt n, Void arg) {
+            distinctOperators.add("if");
+            totalOperators++;
+            super.visit(n, arg);
+        }
+
+        @Override
+        public void visit(ForStmt n, Void arg) {
+            distinctOperators.add("for");
+            totalOperators++;
+            super.visit(n, arg);
+        }
+
+        @Override
+        public void visit(WhileStmt n, Void arg) {
+            distinctOperators.add("while");
+            totalOperators++;
+            super.visit(n, arg);
+        }
+
+        @Override
+        public void visit(DoStmt n, Void arg) {
+            distinctOperators.add("do");
+            totalOperators++;
+            super.visit(n, arg);
+        }
+
+        @Override
+        public void visit(SwitchStmt n, Void arg) {
+            distinctOperators.add("switch");
+            totalOperators++;
+            super.visit(n, arg);
+        }
+
+        // Altri costrutti
+        @Override
+        public void visit(AssignExpr n, Void arg) {
+            String operator = n.getOperator().asString();
+            distinctOperators.add(operator);
+            totalOperators++;
+            super.visit(n, arg);
         }
     }
 }
